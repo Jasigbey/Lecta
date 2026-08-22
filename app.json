@@ -1,0 +1,38 @@
+{
+  "expo": {
+    "name": "LECTA",
+    "slug": "Lecta",
+    "version": "1.0.0",
+    "scheme": "lecta",
+    "orientation": "portrait",
+    "icon": "./assets/App_Logo.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#FFFFFF",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      "expo-web-browser",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow Lecta to access your photo library to send images in chat.",
+          "cameraPermission": "Allow Lecta to access your camera to take photos in chat."
+        }
+      ]
+    ]
+  }
+}
