@@ -57,6 +57,7 @@ import {
   PickedMedia,
 } from '../lib/chat-attachments';
 import { openInAppFile, shareRemoteFile, downloadFileOffline } from '../lib/file-viewer';
+import * as Clipboard from 'expo-clipboard';
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
@@ -237,7 +238,16 @@ export default function ChatDetailScreen() {
             if (payload.eventType === 'INSERT') {
               const newMsg = payload.new as Message;
               setMessages((prev) => {
-                if (prev.find(m => m.id === newMsg.id)) return prev;
+                if (prev.some((m) => m.id === newMsg.id)) return prev;
+                // If there is an optimistic temp message matching this payload, replace it
+                const optIndex = prev.findIndex(
+                  (m) => m.id.startsWith('temp_') && m.sender_id === newMsg.sender_id && m.content === newMsg.content
+                );
+                if (optIndex !== -1) {
+                  const updated = [...prev];
+                  updated[optIndex] = newMsg;
+                  return updated;
+                }
                 return [...prev, newMsg];
               });
               setTimeout(() => {
@@ -245,10 +255,10 @@ export default function ChatDetailScreen() {
               }, 100);
             } else if (payload.eventType === 'UPDATE') {
               const updatedMsg = payload.new as Message;
-              setMessages((prev) => prev.map(m => m.id === updatedMsg.id ? updatedMsg : m));
+              setMessages((prev) => prev.map((m) => (m.id === updatedMsg.id ? updatedMsg : m)));
             } else if (payload.eventType === 'DELETE') {
               const deletedId = payload.old.id;
-              setMessages((prev) => prev.filter(m => m.id !== deletedId));
+              setMessages((prev) => prev.filter((m) => m.id !== deletedId));
             }
           }
         )
@@ -283,7 +293,7 @@ export default function ChatDetailScreen() {
         Alert.alert('Error', 'Failed to update message.');
       }
     } else {
-      const tempId = Date.now().toString();
+      const tempId = `temp_${Date.now()}`;
       const optimisticMsg: Message = {
         id: tempId,
         sender_id: currentUserId,
@@ -304,8 +314,14 @@ export default function ChatDetailScreen() {
 
       if (error) {
         console.error('Send error:', error);
+        setMessages((prev) => prev.filter((m) => m.id !== tempId));
       } else if (data) {
-        setMessages((prev) => prev.map(m => m.id === tempId ? data : m));
+        setMessages((prev) => {
+          if (prev.some((m) => m.id === data.id && m.id !== tempId)) {
+            return prev.filter((m) => m.id !== tempId);
+          }
+          return prev.map((m) => (m.id === tempId ? data : m));
+        });
       }
     }
     
@@ -321,10 +337,6 @@ export default function ChatDetailScreen() {
 
   const handlePickImage = async (fromCamera: boolean) => {
     setShowAttachMenu(false);
-    if (Platform.OS !== 'web') {
-      // Allow modal dismiss transition to settle on native side
-      await new Promise((r) => setTimeout(r, Platform.OS === 'android' ? 300 : 150));
-    }
     try {
       const picked = await pickChatImage(fromCamera);
       if (!picked) return;
@@ -338,16 +350,12 @@ export default function ChatDetailScreen() {
       setMessage('');
     } catch (err: any) {
       console.error('Image pick error:', err);
-      Alert.alert('Image Selection Failed', err.message || 'Could not access photo.');
+      Alert.alert('Image Selection Failed', err?.message || 'Could not access photo.');
     }
   };
 
   const handlePickDocument = async () => {
     setShowAttachMenu(false);
-    if (Platform.OS !== 'web') {
-      // Allow modal dismiss transition to settle on native side
-      await new Promise((r) => setTimeout(r, Platform.OS === 'android' ? 300 : 150));
-    }
     try {
       const picked = await pickChatDocument();
       if (!picked) return;
@@ -360,7 +368,7 @@ export default function ChatDetailScreen() {
       setMessage('');
     } catch (err: any) {
       console.error('Document pick error:', err);
-      Alert.alert('Document Selection Failed', err.message || 'Could not select document.');
+      Alert.alert('Document Selection Failed', err?.message || 'Could not select document.');
     }
   };
 
@@ -504,16 +512,44 @@ export default function ChatDetailScreen() {
   };
 
   const handleMessageLongPress = (msg: Message) => {
-    if (msg.sender_id !== user?.id) return;
-    Alert.alert('Message Options', 'What would you like to do?', [
-      { text: 'Edit', onPress: () => { const parsed = parseMessageContent(msg.content); setMessage(parsed.text); setEditingMsgId(msg.id); } },
-      { text: 'Delete', style: 'destructive', onPress: async () => {
-          setMessages(prev => prev.filter(m => m.id !== msg.id));
+    const isMe = msg.sender_id === user?.id;
+    const parsed = parseMessageContent(msg.content);
+    const options: any[] = [];
+
+    if (parsed.text) {
+      options.push({
+        text: '📋 Copy Text',
+        onPress: async () => {
+          await Clipboard.setStringAsync(parsed.text);
+          Alert.alert('Copied! 📋', 'Message copied to clipboard.');
+        },
+      });
+    }
+
+    if (isMe) {
+      if (parsed.text) {
+        options.push({
+          text: '✏️ Edit',
+          onPress: () => {
+            setMessage(parsed.text);
+            setEditingMsgId(msg.id);
+          },
+        });
+      }
+      options.push({
+        text: '🗑️ Delete',
+        style: 'destructive',
+        onPress: async () => {
+          setMessages((prev) => prev.filter((m) => m.id !== msg.id));
           const { error } = await supabase.from('chat_messages').delete().eq('id', msg.id);
           if (error) Alert.alert('Error', 'Could not delete message.');
-        } },
-      { text: 'Cancel', style: 'cancel' },
-    ]);
+        },
+      });
+    }
+
+    options.push({ text: 'Cancel', style: 'cancel' });
+
+    Alert.alert('Message Options', undefined, options);
   };
 
   const chatName = chatInfo?.is_group ? (chatInfo?.title || 'Group Chat') : (otherDisplayName || chatInfo?.title || 'Direct Message');
@@ -577,14 +613,14 @@ export default function ChatDetailScreen() {
           </View>
         )}
 
-        {messages.map((msg) => {
+        {messages.map((msg, index) => {
           const isMe = msg.sender_id === user?.id;
           const timeString = formatTime(msg.created_at);
           const parsed = parseMessageContent(msg.content);
           const hasAttachment = !!parsed.attachment;
 
           return (
-            <View key={msg.id} style={[styles.msgRow, isMe ? styles.userMsgRow : styles.otherMsgRow]}>
+            <View key={`${msg.id}_${index}`} style={[styles.msgRow, isMe ? styles.userMsgRow : styles.otherMsgRow]}>
               <TouchableOpacity
                 onLongPress={() => handleMessageLongPress(msg)}
                 delayLongPress={250}
@@ -605,7 +641,10 @@ export default function ChatDetailScreen() {
                       time: timeString,
                       isMe,
                     })}
-                    style={styles.imageAttachWrap}
+                    style={[
+                      styles.imageAttachWrap,
+                      { backgroundColor: isDarkMode ? '#1e293b' : '#e2e8f0' },
+                    ]}
                   >
                     <Image
                       source={{ uri: parsed.attachment.url }}
@@ -618,14 +657,19 @@ export default function ChatDetailScreen() {
                 {/* 2. DOCUMENT ATTACHMENT */}
                 {hasAttachment && parsed.attachment?.type === 'document' && (() => {
                   const docInfo = getDocumentTypeInfo(parsed.attachment!.name);
+                  const docUrl = parsed.attachment!.url;
+                  const docName = parsed.attachment!.name || 'Document';
+                  const docSize = parsed.attachment!.size || 'Document';
+
                   return (
                     <TouchableOpacity
                       activeOpacity={0.8}
-                      onPress={() => setSelectedDoc({
+                      onPress={() => openInAppFile(docUrl, docName)}
+                      onLongPress={() => setSelectedDoc({
                         id: msg.id,
-                        url: parsed.attachment!.url,
-                        name: parsed.attachment!.name || 'Document',
-                        size: parsed.attachment!.size || 'Document',
+                        url: docUrl,
+                        name: docName,
+                        size: docSize,
                       })}
                       style={[
                         styles.docAttachCard,
@@ -640,7 +684,7 @@ export default function ChatDetailScreen() {
                       </View>
                       <View style={{ flex: 1 }}>
                         <Text style={[styles.docName, { color: isMe ? '#ffffff' : colors.text }]} numberOfLines={1}>
-                          {parsed.attachment!.name || 'Document'}
+                          {docName}
                         </Text>
                         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 2 }}>
                           <View style={[styles.docBadge, { backgroundColor: isMe ? 'rgba(255,255,255,0.25)' : (isDarkMode ? '#334155' : '#e2e8f0') }]}>
@@ -649,7 +693,7 @@ export default function ChatDetailScreen() {
                             </Text>
                           </View>
                           <Text style={[styles.docSize, { color: isMe ? '#bfdbfe' : colors.textSecondary }]}>
-                            {parsed.attachment!.size || 'Tap to view'}
+                            {docSize}
                           </Text>
                         </View>
                       </View>
@@ -826,8 +870,8 @@ export default function ChatDetailScreen() {
       </KeyboardAvoidingView>
 
       {/* 1. ATTACHMENT MENU BOTTOM SHEET */}
-      <Modal visible={showAttachMenu} transparent animationType="fade" onRequestClose={() => setShowAttachMenu(false)}>
-        <View style={styles.modalOverlay}>
+      {showAttachMenu && (
+        <View style={styles.inViewModalOverlay}>
           <TouchableOpacity
             style={StyleSheet.absoluteFillObject}
             activeOpacity={1}
@@ -858,7 +902,7 @@ export default function ChatDetailScreen() {
             </View>
           </View>
         </View>
-      </Modal>
+      )}
 
       {/* 2. PRE-SEND ATTACHMENT PREVIEW & CAPTION MODAL */}
       <Modal visible={!!pendingAttachment} transparent animationType="slide" onRequestClose={() => setPendingAttachment(null)}>
@@ -1125,11 +1169,10 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     overflow: 'hidden',
     marginBottom: 4,
-    backgroundColor: '#000000',
   },
   attachedImage: {
-    width: Math.min(SCREEN_WIDTH * 0.68, 250),
-    height: Math.min(SCREEN_WIDTH * 0.68, 250) * 0.75,
+    width: Math.min(SCREEN_WIDTH * 0.68, 260),
+    height: Math.min(SCREEN_WIDTH * 0.68, 260) * 0.75,
     borderRadius: 14,
   },
 
@@ -1303,6 +1346,13 @@ const styles = StyleSheet.create({
   },
 
   /* ATTACHMENT MODAL SHEET */
+  inViewModalOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    justifyContent: 'flex-end',
+    zIndex: 9999,
+    elevation: 20,
+  },
   modalOverlay: {
     flex: 1,
     backgroundColor: 'rgba(0,0,0,0.5)',

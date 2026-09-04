@@ -12,6 +12,7 @@ import {
   Alert,
   Modal,
   FlatList,
+  Image,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import {
@@ -39,12 +40,13 @@ import {
   FileText,
 } from 'lucide-react-native';
 import * as LegacyFS from 'expo-file-system/legacy';
+import * as Clipboard from 'expo-clipboard';
 import { safeStorage } from '../lib/storage';
 import { router } from 'expo-router';
 import { useTheme } from '../context/ThemeContext';
 import { useAuth } from '../context/AuthContext';
 import { callGemini, GeminiMessage, GeminiAttachment } from '../lib/gemini';
-import { pickChatImage, pickChatDocument } from '../lib/chat-attachments';
+import { pickChatImage, pickChatDocument, uriToBase64 } from '../lib/chat-attachments';
 
 const SESSIONS_STORAGE_KEY = '@lecta_ai_study_sessions_v2';
 
@@ -143,72 +145,43 @@ What are we studying today?`;
   } | null>(null);
 
   const getBase64FromUri = async (uri: string): Promise<string> => {
+    return await uriToBase64(uri);
+  };
+
+  const handlePickImage = async (fromCamera: boolean) => {
+    setShowAttachMenu(false);
     try {
-      if (uri.startsWith('data:')) {
-        return uri.split(',')[1] || '';
-      }
-      if (Platform.OS === 'web') {
-        const res = await fetch(uri);
-        const blob = await res.blob();
-        return new Promise((resolve) => {
-          const reader = new FileReader();
-          reader.onloadend = () => {
-            const result = (reader.result as string) || '';
-            const base64 = result.includes(',') ? result.split(',')[1] : result;
-            resolve(base64);
-          };
-          reader.onerror = () => resolve('');
-          reader.readAsDataURL(blob);
-        });
-      } else {
-        return await LegacyFS.readAsStringAsync(uri, {
-          encoding: LegacyFS.EncodingType.Base64,
-        });
-      }
-    } catch (err) {
-      console.warn('Base64 conversion notice:', err);
-      return '';
+      const picked = await pickChatImage(fromCamera);
+      if (!picked) return;
+      const base64Data = await getBase64FromUri(picked.uri);
+      setPendingAttachment({
+        uri: picked.uri,
+        name: picked.name,
+        mimeType: picked.mimeType,
+        type: 'image',
+        base64Data,
+      });
+    } catch (err: any) {
+      console.error('AI image selection error:', err);
     }
   };
 
-  const handlePickImage = (fromCamera: boolean) => {
+  const handlePickDocument = async () => {
     setShowAttachMenu(false);
-    setTimeout(async () => {
-      try {
-        const picked = await pickChatImage(fromCamera);
-        if (!picked) return;
-        const base64Data = await getBase64FromUri(picked.uri);
-        setPendingAttachment({
-          uri: picked.uri,
-          name: picked.name,
-          mimeType: picked.mimeType,
-          type: 'image',
-          base64Data,
-        });
-      } catch (err: any) {
-        console.error('AI image selection error:', err);
-      }
-    }, Platform.OS === 'web' ? 0 : 250);
-  };
-
-  const handlePickDocument = () => {
-    setShowAttachMenu(false);
-    setTimeout(async () => {
-      try {
-        const picked = await pickChatDocument();
-        if (!picked) return;
-        const base64Data = await getBase64FromUri(picked.uri);
-        setPendingAttachment({
-          uri: picked.uri,
-          name: picked.name,
-          mimeType: picked.mimeType,
-          type: 'document',
-          base64Data,
-        });
-      } catch (err: any) {
-        console.error('AI document selection error:', err);
-      }
-    }, Platform.OS === 'web' ? 0 : 250);
+    try {
+      const picked = await pickChatDocument();
+      if (!picked) return;
+      const base64Data = await getBase64FromUri(picked.uri);
+      setPendingAttachment({
+        uri: picked.uri,
+        name: picked.name,
+        mimeType: picked.mimeType,
+        type: 'document',
+        base64Data,
+      });
+    } catch (err: any) {
+      console.error('AI document selection error:', err);
+    }
   };
 
   // Load all sessions from safeStorage on mount
@@ -320,14 +293,34 @@ What are we studying today?`;
     updateSessionsWithChat(updatedChat);
 
     try {
-      // Build conversation history for multi-turn Gemini reasoning
-      const history: GeminiMessage[] = updatedChat
-        .filter((m) => m.id !== 'welcome' && !m.isError)
-        .slice(0, -1) // exclude latest user message
-        .map((m) => ({
-          role: m.sender === 'user' ? 'user' : 'model',
-          text: m.text,
-        }));
+      // Build conversation history with full multi-turn memory (including past attached PDFs & images)
+      const history: GeminiMessage[] = await Promise.all(
+        updatedChat
+          .filter((m) => m.id !== 'welcome' && !m.isError)
+          .slice(0, -1) // exclude latest user message
+          .map(async (m) => {
+            let histAttachment: GeminiAttachment | undefined = undefined;
+            if (m.attachment?.uri) {
+              try {
+                const b64 = await uriToBase64(m.attachment.uri);
+                if (b64) {
+                  histAttachment = {
+                    mimeType: m.attachment.mimeType,
+                    base64Data: b64,
+                    fileName: m.attachment.name,
+                  };
+                }
+              } catch (histErr) {
+                console.warn('History attachment load notice:', histErr);
+              }
+            }
+            return {
+              role: m.sender === 'user' ? 'user' : 'model',
+              text: m.text,
+              attachment: histAttachment,
+            };
+          })
+      );
 
       const geminiAttachment: GeminiAttachment | undefined = currentAttachment?.base64Data
         ? {
@@ -410,30 +403,470 @@ What are we studying today?`;
     ]);
   };
 
-  const handleCopy = (msg: ChatMessage) => {
-    setCopiedId(msg.id);
-    setTimeout(() => setCopiedId(null), 2000);
+  const handleCopy = async (msg: ChatMessage) => {
+    try {
+      const cleanText = formatScientificText(msg.text);
+      if (Clipboard && typeof Clipboard.setStringAsync === 'function') {
+        await Clipboard.setStringAsync(cleanText);
+      } else if (Platform.OS === 'web' && typeof navigator !== 'undefined' && navigator.clipboard) {
+        await navigator.clipboard.writeText(cleanText);
+      }
+      setCopiedId(msg.id);
+      setTimeout(() => setCopiedId(null), 2000);
+      Alert.alert('Copied! 📋', 'Message text copied to clipboard.');
+    } catch (e) {
+      console.warn('Copy error:', e);
+      setCopiedId(msg.id);
+      setTimeout(() => setCopiedId(null), 2000);
+    }
   };
 
-  // Helper to render basic markdown bold/bullets
-  const renderFormattedText = (text: string, isMe: boolean) => {
-    return text.split('\n').map((line, lineIdx) => {
-      const parts = line.split(/(\*\*.*?\*\*)/g);
+  const handleMessageLongPress = (msg: ChatMessage) => {
+    const isMe = msg.sender === 'user';
+    const options: { text: string; style?: 'default' | 'cancel' | 'destructive'; onPress?: () => void }[] = [
+      {
+        text: '📋 Copy Message',
+        onPress: () => handleCopy(msg),
+      },
+    ];
+
+    if (isMe) {
+      options.push({
+        text: '✏️ Edit / Use as Prompt',
+        onPress: () => {
+          setMessage(msg.text);
+          setTimeout(() => textInputRef.current?.focus(), 50);
+        },
+      });
+    }
+
+    options.push({
+      text: '🗑️ Delete Message',
+      style: 'destructive',
+      onPress: () => {
+        const nextChat = chat.filter((m) => m.id !== msg.id);
+        setChat(nextChat);
+        updateSessionsWithChat(nextChat);
+      },
+    });
+
+    options.push({
+      text: 'Cancel',
+      style: 'cancel',
+    });
+
+    Alert.alert('Message Options', 'Choose an action for this message:', options);
+  };
+
+  // Helper to map and convert carets (^) into true Unicode superscripts
+  const convertSuperscripts = (str: string): string => {
+    const superscriptMap: Record<string, string> = {
+      '0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴',
+      '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹',
+      '+': '⁺', '-': '⁻', '=': '⁼', '(': '⁽', ')': '⁾',
+      'a': 'ᵃ', 'b': 'ᵇ', 'c': 'ᶜ', 'd': 'ᵈ', 'e': 'ᵉ',
+      'f': 'ᶠ', 'g': 'ᵍ', 'h': 'ʰ', 'i': 'ⁱ', 'j': 'ʲ',
+      'k': 'ᵏ', 'l': 'ˡ', 'm': 'ᵐ', 'n': 'ⁿ', 'o': 'ᵒ',
+      'p': 'ᵖ', 'r': 'ʳ', 's': 'ˢ', 't': 'ᵗ', 'u': 'ᵘ',
+      'v': 'ᵛ', 'w': 'ʷ', 'x': 'ˣ', 'y': 'ʸ', 'z': 'ᶻ',
+    };
+
+    // Convert ^{...} format
+    let result = str.replace(/\^\{([a-zA-Z0-9+\-=()]+)\}/g, (_, content) => {
+      return content.split('').map((char: string) => superscriptMap[char] || char).join('');
+    });
+    // Convert ^(...) format
+    result = result.replace(/\^\(([a-zA-Z0-9+\-=]+)\)/g, (_, content) => {
+      return content.split('').map((char: string) => superscriptMap[char] || char).join('');
+    });
+    // Convert ^x single char format (e.g. x^2, 10^-5, O(n^2))
+    result = result.replace(/\^([a-zA-Z0-9+\-])/g, (_, char) => {
+      return superscriptMap[char] || `^${char}`;
+    });
+    return result;
+  };
+
+  // Clean raw LaTeX & convert scientific symbols (lambda, mu, alpha, etc.)
+  const formatScientificText = (str: string): string => {
+    // Strip LaTeX math dollar delimiters ($$...$$ or $...$) while preserving currency ($10, $5.50)
+    let cleaned = str
+      .replace(/\$\$([\s\S]+?)\$\$/g, '$1')
+      .replace(/\$([a-zA-Z0-9\\_^{}\s+\-=/*()<>≠≤≥±α-ωΑ-ΩλμπθσδΔΩ√±°]+?)\$/g, '$1')
+      .replace(/\$([a-zA-Zα-ωΑ-ΩλμπθσδΔΩ])/g, '$1')
+      .replace(/\\lambda\b/g, 'λ')
+      .replace(/\\Lambda\b/g, 'Λ')
+      .replace(/\\mu\b/g, 'μ')
+      .replace(/\\alpha\b/g, 'α')
+      .replace(/\\beta\b/g, 'β')
+      .replace(/\\gamma\b/g, 'γ')
+      .replace(/\\Gamma\b/g, 'Γ')
+      .replace(/\\theta\b/g, 'θ')
+      .replace(/\\Theta\b/g, 'Θ')
+      .replace(/\\pi\b/g, 'π')
+      .replace(/\\Pi\b/g, 'Π')
+      .replace(/\\sigma\b/g, 'σ')
+      .replace(/\\Sigma\b/g, 'Σ')
+      .replace(/\\delta\b/g, 'δ')
+      .replace(/\\Delta\b/g, 'Δ')
+      .replace(/\\omega\b/g, 'ω')
+      .replace(/\\Omega\b/g, 'Ω')
+      .replace(/\\epsilon\b/g, 'ε')
+      .replace(/\\rho\b/g, 'ρ')
+      .replace(/\\tau\b/g, 'τ')
+      .replace(/\\phi\b/g, 'φ')
+      .replace(/\\Phi\b/g, 'Φ')
+      .replace(/\\psi\b/g, 'ψ')
+      .replace(/\\sqrt\{([^}]+)\}/g, '√($1)')
+      .replace(/\\sqrt\b/g, '√')
+      .replace(/\\pm\b/g, '±')
+      .replace(/\\mp\b/g, '∓')
+      .replace(/\\neq\b|\\ne\b/g, '≠')
+      .replace(/\\leq\b|\\le\b/g, '≤')
+      .replace(/\\geq\b|\\ge\b/g, '≥')
+      .replace(/\\approx\b/g, '≈')
+      .replace(/\\times\b/g, '×')
+      .replace(/\\div\b/g, '÷')
+      .replace(/\\infty\b/g, '∞')
+      .replace(/\\degree\b|\^\\circ/g, '°')
+      .replace(/\\int\b/g, '∫')
+      .replace(/\\sum\b/g, '∑')
+      .replace(/\\prod\b/g, '∏')
+      .replace(/\\left/g, '')
+      .replace(/\\right/g, '')
+      .replace(/\\\[/g, '')
+      .replace(/\\\]/g, '')
+      .replace(/\\\(/g, '')
+      .replace(/\\\)/g, '')
+      .replace(/\\text\{([^}]+)\}/g, '$1')
+      .replace(/\\mathbf\{([^}]+)\}/g, '$1')
+      .replace(/\\mathrm\{([^}]+)\}/g, '$1')
+      .replace(/\\mathit\{([^}]+)\}/g, '$1');
+
+    return convertSuperscripts(cleaned);
+  };
+
+  // Helper to render rich, beautifully formatted markdown without raw symbols
+  const renderFormattedText = (rawText: string, isMe: boolean) => {
+    if (isMe) {
       return (
-        <Text key={lineIdx} style={[styles.msgLine, isMe ? styles.userMsgText : { color: colors.text }]}>
-          {parts.map((part, partIdx) => {
-            if (part.startsWith('**') && part.endsWith('**')) {
-              return (
-                <Text key={partIdx} style={{ fontWeight: '800' }}>
-                  {part.slice(2, -2)}
-                </Text>
-              );
-            }
-            return part;
-          })}
+        <Text style={[styles.msgLine, styles.userMsgText]}>
+          {formatScientificText(rawText)}
+        </Text>
+      );
+    }
+
+    const cleanedText = formatScientificText(rawText);
+    const lines = cleanedText.split('\n');
+
+    // Parse inline formatting (**bold**, *italic*, `code`)
+    const renderInline = (lineContent: string, baseStyle?: any) => {
+      const regex = /(\*\*.*?\*\*|`.*?`|\*.*?\*|__.*?__)/g;
+      const parts = lineContent.split(regex);
+
+      return parts.map((part, pIdx) => {
+        if (!part) return null;
+        if ((part.startsWith('**') && part.endsWith('**')) || (part.startsWith('__') && part.endsWith('__'))) {
+          return (
+            <Text key={pIdx} style={[baseStyle, { fontWeight: '700', color: colors.text }]}>
+              {part.slice(2, -2)}
+            </Text>
+          );
+        }
+        if (part.startsWith('`') && part.endsWith('`')) {
+          return (
+            <Text
+              key={pIdx}
+              style={[
+                baseStyle,
+                {
+                  fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+                  backgroundColor: isDarkMode ? '#334155' : '#f1f5f9',
+                  color: colors.primary,
+                  paddingHorizontal: 4,
+                  borderRadius: 4,
+                  fontSize: 13,
+                },
+              ]}
+            >
+              {part.slice(1, -1)}
+            </Text>
+          );
+        }
+        if (part.startsWith('*') && part.endsWith('*')) {
+          return (
+            <Text key={pIdx} style={[baseStyle, { fontStyle: 'italic' }]}>
+              {part.slice(1, -1)}
+            </Text>
+          );
+        }
+        return (
+          <Text key={pIdx} style={baseStyle}>
+            {part}
+          </Text>
+        );
+      });
+    };
+
+    let inCodeBlock = false;
+    let codeBlockBuffer: string[] = [];
+    const elements: React.ReactNode[] = [];
+
+    lines.forEach((line, idx) => {
+      const trimmed = line.trim();
+
+      // Check code block fences (```)
+      if (trimmed.startsWith('```')) {
+        if (inCodeBlock) {
+          const codeContent = codeBlockBuffer.join('\n');
+          codeBlockBuffer = [];
+          inCodeBlock = false;
+          elements.push(
+            <View
+              key={`code_${idx}`}
+              style={{
+                backgroundColor: isDarkMode ? '#0f172a' : '#f8fafc',
+                borderColor: colors.cardBorder,
+                borderWidth: 1,
+                borderRadius: 10,
+                padding: 10,
+                marginVertical: 6,
+              }}
+            >
+              <Text
+                style={{
+                  fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+                  fontSize: 12.5,
+                  color: isDarkMode ? '#e2e8f0' : '#1e293b',
+                  lineHeight: 18,
+                }}
+              >
+                {codeContent}
+              </Text>
+            </View>
+          );
+        } else {
+          inCodeBlock = true;
+        }
+        return;
+      }
+
+      if (inCodeBlock) {
+        codeBlockBuffer.push(line);
+        return;
+      }
+
+      // Empty line
+      if (!trimmed) {
+        elements.push(<View key={`sp_${idx}`} style={{ height: 6 }} />);
+        return;
+      }
+
+      // Horizontal dividers (--- or ***)
+      if (/^[-*_]{3,}$/.test(trimmed)) {
+        elements.push(
+          <View
+            key={`hr_${idx}`}
+            style={{
+              height: 1,
+              backgroundColor: colors.cardBorder,
+              marginVertical: 8,
+            }}
+          />
+        );
+        return;
+      }
+
+      // Subheadings (### or ####)
+      if (trimmed.startsWith('### ') || trimmed.startsWith('#### ')) {
+        const title = trimmed.replace(/^#{3,4}\s+/, '');
+        elements.push(
+          <Text
+            key={`h3_${idx}`}
+            style={{
+              fontSize: 15,
+              fontWeight: '700',
+              color: colors.primary,
+              marginTop: 6,
+              marginBottom: 3,
+            }}
+          >
+            {renderInline(title)}
+          </Text>
+        );
+        return;
+      }
+
+      // Main Headings (# or ##)
+      if (trimmed.startsWith('# ') || trimmed.startsWith('## ')) {
+        const title = trimmed.replace(/^#{1,2}\s+/, '');
+        elements.push(
+          <Text
+            key={`h1_${idx}`}
+            style={{
+              fontSize: 16.5,
+              fontWeight: '800',
+              color: colors.text,
+              marginTop: 8,
+              marginBottom: 4,
+            }}
+          >
+            {renderInline(title)}
+          </Text>
+        );
+        return;
+      }
+
+      // MCQ Option lines: A) Option, B) Option, C) Option, D) Option (or A., B., C., D.)
+      const mcqOptionMatch = trimmed.match(/^([A-D]\))\s*(.*)/i) || trimmed.match(/^([A-D]\.)\s*(.*)/i);
+      if (mcqOptionMatch) {
+        const optionLetter = mcqOptionMatch[1].toUpperCase();
+        const optionText = mcqOptionMatch[2];
+        elements.push(
+          <View
+            key={`opt_${idx}`}
+            style={{
+              flexDirection: 'row',
+              alignItems: 'flex-start',
+              gap: 8,
+              paddingVertical: 3,
+              paddingLeft: 4,
+            }}
+          >
+            <View
+              style={{
+                backgroundColor: isDarkMode ? '#1e293b' : '#eff6ff',
+                borderColor: isDarkMode ? '#334155' : '#bfdbfe',
+                borderWidth: 1,
+                borderRadius: 6,
+                paddingHorizontal: 6,
+                paddingVertical: 1,
+              }}
+            >
+              <Text style={{ fontSize: 12, fontWeight: '700', color: colors.primary }}>
+                {optionLetter}
+              </Text>
+            </View>
+            <Text style={{ flex: 1, fontSize: 14, color: colors.text, lineHeight: 20 }}>
+              {renderInline(optionText)}
+            </Text>
+          </View>
+        );
+        return;
+      }
+
+      // Correct Answer line: "Answer: A" or "Correct Answer: B"
+      if (/^(correct answer|answer):\s*/i.test(trimmed)) {
+        elements.push(
+          <View
+            key={`ans_${idx}`}
+            style={{
+              backgroundColor: isDarkMode ? '#064e3b' : '#ecfdf5',
+              borderColor: isDarkMode ? '#059669' : '#a7f3d0',
+              borderWidth: 1,
+              borderRadius: 8,
+              paddingHorizontal: 10,
+              paddingVertical: 6,
+              marginVertical: 4,
+            }}
+          >
+            <Text style={{ fontSize: 13.5, fontWeight: '700', color: isDarkMode ? '#34d399' : '#059669' }}>
+              {renderInline(trimmed)}
+            </Text>
+          </View>
+        );
+        return;
+      }
+
+      // Explanation line: "Explanation: ..."
+      if (/^explanation:\s*/i.test(trimmed)) {
+        elements.push(
+          <View
+            key={`exp_${idx}`}
+            style={{
+              backgroundColor: isDarkMode ? '#1e293b' : '#f8fafc',
+              borderColor: colors.cardBorder,
+              borderWidth: 1,
+              borderRadius: 8,
+              paddingHorizontal: 10,
+              paddingVertical: 6,
+              marginVertical: 3,
+            }}
+          >
+            <Text style={{ fontSize: 13, color: colors.textSecondary, lineHeight: 19 }}>
+              {renderInline(trimmed)}
+            </Text>
+          </View>
+        );
+        return;
+      }
+
+      // Bullet points (*, -, •)
+      if (/^[*•-]\s+/.test(trimmed)) {
+        const bulletText = trimmed.replace(/^[*•-]\s+/, '');
+        elements.push(
+          <View
+            key={`bullet_${idx}`}
+            style={{
+              flexDirection: 'row',
+              alignItems: 'flex-start',
+              gap: 8,
+              paddingVertical: 2,
+              paddingLeft: 4,
+            }}
+          >
+            <Text style={{ fontSize: 14, color: colors.primary, lineHeight: 20 }}>•</Text>
+            <Text style={{ flex: 1, fontSize: 14, color: colors.text, lineHeight: 21 }}>
+              {renderInline(bulletText)}
+            </Text>
+          </View>
+        );
+        return;
+      }
+
+      // Numbered List / Questions: "1. ", "20. ", "Question 1:", "Q1:"
+      const numberedMatch = trimmed.match(/^(\d+\.|Question\s+\d+:?|Q\d+:?)\s*(.*)/i);
+      if (numberedMatch) {
+        const prefix = numberedMatch[1];
+        const rest = numberedMatch[2];
+        elements.push(
+          <View
+            key={`num_${idx}`}
+            style={{
+              flexDirection: 'row',
+              alignItems: 'flex-start',
+              gap: 6,
+              marginTop: 6,
+              marginBottom: 2,
+            }}
+          >
+            <Text style={{ fontSize: 14.5, fontWeight: '800', color: colors.primary }}>
+              {prefix}
+            </Text>
+            <Text style={{ flex: 1, fontSize: 14.5, fontWeight: '600', color: colors.text, lineHeight: 22 }}>
+              {renderInline(rest)}
+            </Text>
+          </View>
+        );
+        return;
+      }
+
+      // Standard text line
+      elements.push(
+        <Text
+          key={`txt_${idx}`}
+          style={{
+            fontSize: 14,
+            color: colors.text,
+            lineHeight: 21,
+            marginBottom: 2,
+          }}
+        >
+          {renderInline(trimmed)}
         </Text>
       );
     });
+
+    return <View style={{ gap: 2 }}>{elements}</View>;
   };
 
   return (
@@ -522,7 +955,10 @@ What are we studying today?`;
                 </View>
               )}
 
-              <View
+              <TouchableOpacity
+                activeOpacity={0.92}
+                onLongPress={() => handleMessageLongPress(msg)}
+                delayLongPress={250}
                 style={[
                   styles.bubble,
                   isMe
@@ -584,7 +1020,7 @@ What are we studying today?`;
                     </TouchableOpacity>
                   )}
                 </View>
-              </View>
+              </TouchableOpacity>
 
               {isMe && (
                 <View style={[styles.userAvatar, { backgroundColor: colors.primary }]}>
@@ -720,14 +1156,9 @@ What are we studying today?`;
         </View>
       </KeyboardAvoidingView>
 
-      {/* ATTACHMENT SELECTION MODAL */}
-      <Modal
-        visible={showAttachMenu}
-        transparent
-        animationType="fade"
-        onRequestClose={() => setShowAttachMenu(false)}
-      >
-        <View style={styles.modalOverlay}>
+      {/* ATTACHMENT MENU BOTTOM SHEET */}
+      {showAttachMenu && (
+        <View style={styles.inViewModalOverlay}>
           <TouchableOpacity
             style={StyleSheet.absoluteFillObject}
             activeOpacity={1}
@@ -758,7 +1189,7 @@ What are we studying today?`;
             </View>
           </View>
         </View>
-      </Modal>
+      )}
 
       {/* PAST CHATS / SESSIONS MODAL */}
       <Modal
@@ -954,7 +1385,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   bubble: {
-    maxWidth: '78%',
+    maxWidth: '86%',
     paddingHorizontal: 16,
     paddingTop: 12,
     paddingBottom: 10,
@@ -1061,6 +1492,13 @@ const styles = StyleSheet.create({
   },
 
   /* SESSIONS / HISTORY MODAL */
+  inViewModalOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    justifyContent: 'flex-end',
+    zIndex: 9999,
+    elevation: 20,
+  },
   modalOverlay: {
     flex: 1,
     backgroundColor: 'rgba(0, 0, 0, 0.5)',
