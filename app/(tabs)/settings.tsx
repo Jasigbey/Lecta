@@ -10,6 +10,10 @@ import {
   Image,
   ActivityIndicator,
   Alert,
+  Modal,
+  TextInput,
+  KeyboardAvoidingView,
+  Platform,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import {
@@ -23,11 +27,15 @@ import {
   ShieldCheck,
   UserX,
   AlertTriangle,
+  Trash2,
+  AlertCircle,
+  X,
 } from 'lucide-react-native';
 import { router, useFocusEffect } from 'expo-router';
 import { useTheme } from '../../context/ThemeContext';
 import { useAuth } from '../../context/AuthContext';
 import { supabase } from '../../lib/supabase';
+import { deleteUserAccount } from '../../lib/account';
 
 import { safeStorage } from '../../lib/storage';
 import { cancelAllScheduledNotifications } from '../../lib/notifications';
@@ -106,56 +114,52 @@ export default function SettingsScreen() {
     ]);
   };
 
-  const handleDeleteAccount = () => {
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const [confirmText, setConfirmText] = useState('');
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  const handleOpenDeleteModal = () => {
+    if (!user) return;
+    setConfirmText('');
+    setDeleteError(null);
+    setShowDeleteModal(true);
+  };
+
+  const handleConfirmDelete = async () => {
     if (!user) return;
 
-    Alert.alert(
-      'Delete Account Permanently',
-      'Are you sure you want to permanently delete your Lecta account? All your personal profile data, course bookmarks, focus tasks, tickets, and message history will be permanently deleted. This action cannot be undone.',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Delete My Account',
-          style: 'destructive',
-          onPress: async () => {
-            try {
-              setIsDeleting(true);
+    if (confirmText.trim().toUpperCase() !== 'DELETE') {
+      setDeleteError('Please type DELETE to confirm.');
+      return;
+    }
 
-              // 1. Delete user records from Supabase
-              await supabase.from('notifications').delete().eq('user_id', user.id);
-              await supabase.from('chat_participants').delete().eq('user_id', user.id);
-              await supabase.from('feedback').delete().eq('user_id', user.id);
-              await supabase.from('profiles').delete().eq('id', user.id);
+    try {
+      setIsDeleting(true);
+      setDeleteError(null);
 
-              // 2. Clear local storage keys for this user
-              await safeStorage.removeItem(`@lecta_privacy_settings_${user.id}`);
-              await safeStorage.removeItem(`@lecta_notifications_enabled_${user.id}`);
-              await safeStorage.removeItem(`@lecta_read_notifications_${user.id}`);
-              await safeStorage.removeItem(`@lecta_deleted_notifications_${user.id}`);
-              await safeStorage.removeItem(`@lecta_push_token_${user.id}`);
+      const result = await deleteUserAccount(user.id);
 
-              // 3. Clear scheduled notifications
-              await cancelAllScheduledNotifications();
+      if (!result.success) {
+        setIsDeleting(false);
+        setDeleteError(result.error || 'Could not delete account. Please try again.');
+        return;
+      }
 
-              // 4. Log out of auth session
-              await logout();
+      setShowDeleteModal(false);
+      setIsDeleting(false);
 
-              setIsDeleting(false);
+      await logout();
+      router.replace('/login');
 
-              Alert.alert(
-                'Account Deleted',
-                'Your account and all associated data have been permanently removed.',
-                [{ text: 'OK', onPress: () => router.replace('/login') }]
-              );
-            } catch (err: any) {
-              setIsDeleting(false);
-              console.error('Delete account error:', err);
-              Alert.alert('Error', err.message || 'Could not delete account. Please try again.');
-            }
-          },
-        },
-      ]
-    );
+      Alert.alert(
+        'Account Deleted',
+        result.message || 'Your account and all associated data have been permanently removed.'
+      );
+    } catch (err: any) {
+      setIsDeleting(false);
+      console.error('Delete account error:', err);
+      setDeleteError(err.message || 'Could not delete account. Please try again.');
+    }
   };
 
   const getInitials = (name: string) => {
@@ -291,7 +295,7 @@ export default function SettingsScreen() {
             <TouchableOpacity
               style={styles.settingRowBtn}
               activeOpacity={0.7}
-              onPress={handleDeleteAccount}
+              onPress={handleOpenDeleteModal}
               disabled={isDeleting}
             >
               <View style={[styles.iconBg, { backgroundColor: isDarkMode ? '#451a1a' : '#fef2f2' }]}>
@@ -324,6 +328,124 @@ export default function SettingsScreen() {
           </TouchableOpacity>
         </View>
       </ScrollView>
+
+      {/* Delete Account Confirmation Modal */}
+      <Modal
+        visible={showDeleteModal}
+        transparent
+        animationType="fade"
+        onRequestClose={() => {
+          if (!isDeleting) setShowDeleteModal(false);
+        }}
+      >
+        <KeyboardAvoidingView
+          behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          style={styles.modalOverlay}
+        >
+          <View style={[styles.modalCard, isDarkMode && styles.darkModalCard]}>
+            {/* Header */}
+            <View style={styles.modalHeader}>
+              <View style={styles.modalHeaderLeft}>
+                <View style={styles.modalIconBadge}>
+                  <Trash2 size={20} color="#dc2626" />
+                </View>
+                <Text style={[styles.modalTitle, isDarkMode && styles.darkText]}>Delete Account</Text>
+              </View>
+              <TouchableOpacity
+                onPress={() => {
+                  if (!isDeleting) setShowDeleteModal(false);
+                }}
+                disabled={isDeleting}
+                hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+              >
+                <X size={20} color={isDarkMode ? '#94a3b8' : '#64748b'} />
+              </TouchableOpacity>
+            </View>
+
+            {/* Warning Content */}
+            <View style={[styles.modalWarningBox, isDarkMode && styles.darkModalWarningBox]}>
+              <AlertTriangle size={18} color="#dc2626" style={{ marginTop: 2 }} />
+              <Text style={[styles.modalWarningText, isDarkMode && styles.darkWarningText]}>
+                This action is permanent and cannot be undone. All of your data will be permanently wiped:
+              </Text>
+            </View>
+
+            <View style={styles.bulletList}>
+              <Text style={[styles.bulletItem, isDarkMode && styles.darkBulletItem]}>• Profile and personal account information</Text>
+              <Text style={[styles.bulletItem, isDarkMode && styles.darkBulletItem]}>• All chat messages and conversations</Text>
+              <Text style={[styles.bulletItem, isDarkMode && styles.darkBulletItem]}>• Saved calendar events and daily study tasks</Text>
+              <Text style={[styles.bulletItem, isDarkMode && styles.darkBulletItem]}>• Notifications and local preferences</Text>
+            </View>
+
+            {/* Confirmation Input */}
+            <Text style={[styles.inputLabel, isDarkMode && styles.darkText]}>
+              Type <Text style={{ fontWeight: '800', color: '#dc2626' }}>DELETE</Text> to confirm:
+            </Text>
+            <TextInput
+              style={[
+                styles.confirmInput,
+                isDarkMode && styles.darkConfirmInput,
+                confirmText.trim().toUpperCase() === 'DELETE' && styles.confirmInputValid,
+              ]}
+              value={confirmText}
+              onChangeText={(val) => {
+                setConfirmText(val);
+                if (deleteError) setDeleteError(null);
+              }}
+              placeholder="DELETE"
+              placeholderTextColor={isDarkMode ? '#64748b' : '#94a3b8'}
+              autoCapitalize="characters"
+              autoCorrect={false}
+              editable={!isDeleting}
+            />
+
+            {deleteError && (
+              <View style={styles.errorContainer}>
+                <AlertCircle size={15} color="#dc2626" />
+                <Text style={styles.errorText}>{deleteError}</Text>
+              </View>
+            )}
+
+            {/* Actions */}
+            <View style={styles.modalActions}>
+              <TouchableOpacity
+                style={[styles.modalCancelBtn, isDarkMode && styles.darkCancelBtn]}
+                onPress={() => setShowDeleteModal(false)}
+                disabled={isDeleting}
+              >
+                <Text style={[styles.modalCancelText, isDarkMode && styles.darkText]}>Cancel</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[
+                  styles.modalDeleteBtn,
+                  (confirmText.trim().toUpperCase() !== 'DELETE' || isDeleting) && styles.modalDeleteBtnDisabled,
+                ]}
+                onPress={handleConfirmDelete}
+                disabled={confirmText.trim().toUpperCase() !== 'DELETE' || isDeleting}
+              >
+                {isDeleting ? (
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                    <ActivityIndicator size="small" color="#ffffff" />
+                    <Text style={styles.modalDeleteText}>Deleting...</Text>
+                  </View>
+                ) : (
+                  <Text style={styles.modalDeleteText}>Delete Account</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </KeyboardAvoidingView>
+      </Modal>
+
+      {/* Full-screen Loading Overlay during Deletion */}
+      {isDeleting && (
+        <View style={styles.fullscreenLoading}>
+          <ActivityIndicator size="large" color="#dc2626" />
+          <Text style={styles.fullscreenLoadingText}>Permanently deleting account...</Text>
+          <Text style={styles.fullscreenLoadingSubtext}>Wiping database records and signing out</Text>
+        </View>
+      )}
     </SafeAreaView>
   );
 }
@@ -480,5 +602,188 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '800',
     color: '#dc2626',
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.55)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 20,
+  },
+  modalCard: {
+    width: '100%',
+    maxWidth: 420,
+    backgroundColor: '#ffffff',
+    borderRadius: 24,
+    padding: 24,
+    shadowColor: '#000',
+    shadowOpacity: 0.25,
+    shadowRadius: 20,
+    shadowOffset: { width: 0, height: 10 },
+    elevation: 10,
+  },
+  darkModalCard: {
+    backgroundColor: '#1e293b',
+    borderWidth: 1,
+    borderColor: '#334155',
+  },
+  modalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 16,
+  },
+  modalHeaderLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  modalIconBadge: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: '#fee2e2',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  modalTitle: {
+    fontSize: 18,
+    fontWeight: '800',
+    color: '#0f172a',
+  },
+  modalWarningBox: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 10,
+    backgroundColor: '#fef2f2',
+    padding: 12,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#fecaca',
+    marginBottom: 14,
+  },
+  darkModalWarningBox: {
+    backgroundColor: '#450a0a',
+    borderColor: '#7f1d1d',
+  },
+  modalWarningText: {
+    flex: 1,
+    fontSize: 13,
+    lineHeight: 18,
+    color: '#991b1b',
+    fontWeight: '500',
+  },
+  darkWarningText: {
+    color: '#fca5a5',
+  },
+  bulletList: {
+    marginBottom: 16,
+    paddingLeft: 4,
+    gap: 6,
+  },
+  bulletItem: {
+    fontSize: 12.5,
+    color: '#64748b',
+    lineHeight: 17,
+  },
+  darkBulletItem: {
+    color: '#94a3b8',
+  },
+  inputLabel: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#334155',
+    marginBottom: 8,
+  },
+  confirmInput: {
+    borderWidth: 1.5,
+    borderColor: '#e2e8f0',
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#0f172a',
+    backgroundColor: '#f8fafc',
+    marginBottom: 10,
+    letterSpacing: 2,
+  },
+  darkConfirmInput: {
+    borderColor: '#475569',
+    backgroundColor: '#0f172a',
+    color: '#f8fafc',
+  },
+  confirmInputValid: {
+    borderColor: '#dc2626',
+  },
+  errorContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginBottom: 12,
+  },
+  errorText: {
+    fontSize: 12,
+    color: '#dc2626',
+    fontWeight: '600',
+  },
+  modalActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    marginTop: 8,
+  },
+  modalCancelBtn: {
+    flex: 1,
+    paddingVertical: 14,
+    borderRadius: 14,
+    backgroundColor: '#f1f5f9',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  darkCancelBtn: {
+    backgroundColor: '#334155',
+  },
+  modalCancelText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#475569',
+  },
+  modalDeleteBtn: {
+    flex: 1.3,
+    paddingVertical: 14,
+    borderRadius: 14,
+    backgroundColor: '#dc2626',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  modalDeleteBtnDisabled: {
+    backgroundColor: '#fca5a5',
+  },
+  modalDeleteText: {
+    fontSize: 14,
+    fontWeight: '800',
+    color: '#ffffff',
+  },
+  fullscreenLoading: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(15, 23, 42, 0.85)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 9999,
+    paddingHorizontal: 30,
+  },
+  fullscreenLoadingText: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: '#ffffff',
+    marginTop: 16,
+    textAlign: 'center',
+  },
+  fullscreenLoadingSubtext: {
+    fontSize: 13,
+    color: '#cbd5e1',
+    marginTop: 6,
+    textAlign: 'center',
   },
 });

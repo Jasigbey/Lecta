@@ -1,6 +1,6 @@
 import * as ImagePicker from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
-import * as LegacyFS from 'expo-file-system/legacy';
+import * as FileSystem from 'expo-file-system';
 import { decode } from 'base64-arraybuffer';
 import { Platform, Alert } from 'react-native';
 import { supabase } from './supabase';
@@ -108,6 +108,53 @@ export function serializeMessageContent(text: string, attachment?: ChatAttachmen
 }
 
 /**
+ * Convert any local file URI into a Base64 string safely across all platforms.
+ */
+export async function uriToBase64(uri: string): Promise<string> {
+  // Method 1: Fetch blob and use FileReader
+  try {
+    const response = await fetch(uri);
+    const blob = await response.blob();
+    const b64 = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const res = (reader.result as string) || '';
+        const data = res.includes(',') ? res.split(',')[1] : res;
+        resolve(data);
+      };
+      reader.onerror = () => reject(new Error('FileReader failed'));
+      reader.readAsDataURL(blob);
+    });
+    if (b64) return b64;
+  } catch (blobErr) {
+    // Continue to next method
+  }
+
+  // Method 2: expo-file-system / legacy
+  try {
+    const LegacyFS = require('expo-file-system/legacy');
+    if (LegacyFS?.readAsStringAsync) {
+      const b64 = await LegacyFS.readAsStringAsync(uri, {
+        encoding: LegacyFS.EncodingType?.Base64 || 'base64',
+      });
+      if (b64) return b64;
+    }
+  } catch {}
+
+  try {
+    const FileSystem = require('expo-file-system');
+    if (FileSystem?.readAsStringAsync) {
+      const b64 = await FileSystem.readAsStringAsync(uri, {
+        encoding: FileSystem.EncodingType?.Base64 || 'base64',
+      });
+      if (b64) return b64;
+    }
+  } catch {}
+
+  return '';
+}
+
+/**
  * Upload any local file URI to Supabase Storage with binary ArrayBuffer conversion.
  */
 export async function uploadChatAttachment(
@@ -116,62 +163,63 @@ export async function uploadChatAttachment(
   mimeType: string,
   userId: string
 ): Promise<string> {
-  const sanitizedName = fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
-  const storagePath = `chat_${userId}/${Date.now()}_${sanitizedName}`;
+  const sanitizedName = (fileName || `file_${Date.now()}`).replace(/[^a-zA-Z0-9._-]/g, '_');
+  const storagePath = `chat_${userId || 'guest'}/${Date.now()}_${sanitizedName}`;
 
-  let binaryData: any;
+  const base64String = await uriToBase64(localUri);
+  const fallbackUri = base64String
+    ? `data:${mimeType || 'image/jpeg'};base64,${base64String}`
+    : localUri;
 
-  if (Platform.OS === 'web') {
-    const response = await fetch(localUri);
-    binaryData = await response.blob();
-  } else {
-    // Read file as Base64 on mobile
-    const base64 = await LegacyFS.readAsStringAsync(localUri, {
-      encoding: LegacyFS.EncodingType.Base64,
-    });
-    binaryData = decode(base64);
+  let binaryData: any = null;
+  if (base64String) {
+    try {
+      binaryData = decode(base64String);
+    } catch {}
+  }
+
+  if (!binaryData) {
+    try {
+      const response = await fetch(localUri);
+      binaryData = await response.blob();
+    } catch {}
+  }
+
+  if (!binaryData) {
+    return fallbackUri;
   }
 
   try {
-    // Try uploading to 'chat-attachments' bucket, or fallback to 'course-materials' or 'avatars'
-    let bucketName = 'chat-attachments';
-    let { error: uploadError } = await supabase.storage
-      .from(bucketName)
-      .upload(storagePath, binaryData, {
-        contentType: mimeType,
-        upsert: true,
-      });
+    let uploadedBucket: string | null = null;
+    const candidateBuckets = ['chat-attachments', 'course-materials', 'avatars'];
 
-    if (uploadError) {
-      bucketName = 'course-materials';
-      const fallback = await supabase.storage
-        .from(bucketName)
+    for (const bucket of candidateBuckets) {
+      const { error: uploadError } = await supabase.storage
+        .from(bucket)
         .upload(storagePath, binaryData, {
-          contentType: mimeType,
+          contentType: mimeType || 'application/octet-stream',
           upsert: true,
         });
 
-      if (fallback.error) {
-        bucketName = 'avatars';
-        const lastTry = await supabase.storage
-          .from(bucketName)
-          .upload(storagePath, binaryData, {
-            contentType: mimeType,
-            upsert: true,
-          });
-
-        if (lastTry.error) {
-          console.warn('Storage upload error, using local file URI fallback:', uploadError || fallback.error || lastTry.error);
-          return localUri;
-        }
+      if (!uploadError) {
+        uploadedBucket = bucket;
+        break;
+      } else {
+        console.warn(`Upload to '${bucket}' failed:`, uploadError.message);
       }
     }
 
-    const { data: urlData } = supabase.storage.from(bucketName).getPublicUrl(storagePath);
-    return urlData?.publicUrl || localUri;
+    if (uploadedBucket) {
+      const { data: urlData } = supabase.storage.from(uploadedBucket).getPublicUrl(storagePath);
+      if (urlData?.publicUrl) {
+        return urlData.publicUrl;
+      }
+    }
+
+    return fallbackUri;
   } catch (err) {
-    console.warn('Error during storage upload, using local URI fallback:', err);
-    return localUri;
+    console.warn('Error during storage upload, using local fallback:', err);
+    return fallbackUri;
   }
 }
 
@@ -184,23 +232,24 @@ export async function pickChatImage(fromCamera: boolean = false): Promise<Picked
       if (Platform.OS !== 'web') {
         const perm = await ImagePicker.requestCameraPermissionsAsync();
         if (!perm.granted) {
-          Alert.alert('Camera Permission', 'Camera permission is required to capture photos. Please enable it in device settings.');
+          Alert.alert('Camera Permission Required', 'Please enable camera access in your device settings to take photos.');
           return null;
         }
       }
       const result = await ImagePicker.launchCameraAsync({
-        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        mediaTypes: ['images'],
         quality: 0.8,
         allowsEditing: false,
       });
       if (result.canceled || !result.assets || result.assets.length === 0) return null;
       const asset = result.assets[0];
-      const name = `photo_${Date.now()}.jpg`;
+      const name = asset.fileName || `photo_${Date.now()}.jpg`;
+      const sizeBytes = asset.fileSize ?? (asset as any).size;
       return {
         uri: asset.uri,
         name,
-        size: formatFileSize(asset.fileSize),
-        mimeType: 'image/jpeg',
+        size: formatFileSize(sizeBytes),
+        mimeType: asset.mimeType || 'image/jpeg',
         width: asset.width,
         height: asset.height,
       };
@@ -208,24 +257,25 @@ export async function pickChatImage(fromCamera: boolean = false): Promise<Picked
       if (Platform.OS !== 'web') {
         const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
         if (!perm.granted) {
-          Alert.alert('Photo Permission', 'Photo library permission is required to select photos. Please enable it in device settings.');
+          Alert.alert('Photo Library Permission Required', 'Please enable photo library access in your device settings to select images.');
           return null;
         }
       }
       const result = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        mediaTypes: ['images'],
         quality: 0.8,
         allowsEditing: false,
       });
       if (result.canceled || !result.assets || result.assets.length === 0) return null;
       const asset = result.assets[0];
       const ext = asset.uri.split('.').pop()?.toLowerCase() || 'jpg';
-      const mimeType = ext === 'png' ? 'image/png' : (ext === 'webp' ? 'image/webp' : 'image/jpeg');
+      const mimeType = asset.mimeType || (ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg');
       const name = asset.fileName || `image_${Date.now()}.${ext}`;
+      const sizeBytes = asset.fileSize ?? (asset as any).size;
       return {
         uri: asset.uri,
         name,
-        size: formatFileSize(asset.fileSize),
+        size: formatFileSize(sizeBytes),
         mimeType,
         width: asset.width,
         height: asset.height,
@@ -233,7 +283,7 @@ export async function pickChatImage(fromCamera: boolean = false): Promise<Picked
     }
   } catch (err: any) {
     console.error('Pick chat image error:', err);
-    Alert.alert('Selection Error', err.message || 'Could not open camera or photo gallery.');
+    Alert.alert('Camera / Photo Error', err?.message || 'Could not open camera or photo library.');
     return null;
   }
 }
@@ -241,30 +291,27 @@ export async function pickChatImage(fromCamera: boolean = false): Promise<Picked
 /**
  * Pick a document (PDF, Word, zip, text, etc.) from device storage safely.
  */
-export function pickChatDocument(): Promise<PickedMedia | null> {
-  return new Promise((resolve) => {
-    DocumentPicker.getDocumentAsync({
+export async function pickChatDocument(): Promise<PickedMedia | null> {
+  try {
+    const result = await DocumentPicker.getDocumentAsync({
       type: '*/*',
       copyToCacheDirectory: true,
       multiple: false,
-    })
-      .then((result) => {
-        if (result.canceled || !result.assets || result.assets.length === 0) {
-          resolve(null);
-          return;
-        }
-        const asset = result.assets[0];
-        resolve({
-          uri: asset.uri,
-          name: asset.name || `doc_${Date.now()}`,
-          size: formatFileSize(asset.size),
-          mimeType: asset.mimeType || 'application/octet-stream',
-        });
-      })
-      .catch((err) => {
-        console.error('Pick chat document error:', err);
-        Alert.alert('Selection Error', err?.message || 'Could not open files app.');
-        resolve(null);
-      });
-  });
+    });
+    if (result.canceled || !result.assets || result.assets.length === 0) {
+      return null;
+    }
+    const asset = result.assets[0];
+    const sizeBytes = asset.size ?? (asset as any).fileSize;
+    return {
+      uri: asset.uri,
+      name: asset.name || `document_${Date.now()}`,
+      size: formatFileSize(sizeBytes),
+      mimeType: asset.mimeType || 'application/octet-stream',
+    };
+  } catch (err: any) {
+    console.error('Pick chat document error:', err);
+    Alert.alert('Document Picker Error', err?.message || 'Could not open files app.');
+    return null;
+  }
 }

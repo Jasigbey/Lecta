@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity,
   KeyboardAvoidingView, Platform, ScrollView, StyleSheet,
-  Animated, Modal, Image, ActivityIndicator,
+  Animated, Modal, Image, ActivityIndicator, Alert,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { router } from 'expo-router';
@@ -11,7 +11,7 @@ import {
   CheckCircle2, Clock, ShieldCheck, PartyPopper,
   KeyRound, X, ArrowLeft, AlertCircle, RefreshCw,
 } from 'lucide-react-native';
-import { supabase } from '../lib/supabase';
+import { supabase, isSupabaseConfigured } from '../lib/supabase';
 import { useAuth } from '../context/AuthContext';
 
 type ApprovalState = 'idle' | 'pending' | 'approved' | 'registered';
@@ -163,47 +163,60 @@ export default function AuthScreen() {
   };
 
   const handleAuth = async () => {
-    setAuthLoading(true);
-    if (!isLogin) {
-      const { data, error } = await supabase.auth.signUp({
-        email,
-        password,
-        options: {
-          data: {
-            full_name: fullName,
-            student_id: studentId,
-            phone_number: phone,
-            role,
-            group,
-            year_level: 'Level 300',
-          },
-        },
-      });
-      setAuthLoading(false);
-      
-      if (error) {
-        alert(error.message);
-        return;
-      }
+    if (!isSupabaseConfigured) {
+      Alert.alert(
+        'Supabase Not Configured',
+        'Your .env file contains placeholder credentials.\n\nPlease add your actual Supabase URL and Anon Key in .env and restart Expo with:\n\nnpx expo start -c'
+      );
+      return;
+    }
 
-      if (role === 'rep') {
-        setApprovalState('pending');
+    setAuthLoading(true);
+    try {
+      if (!isLogin) {
+        const { data, error } = await supabase.auth.signUp({
+          email,
+          password,
+          options: {
+            data: {
+              full_name: fullName,
+              student_id: studentId,
+              phone_number: phone,
+              role,
+              group,
+              year_level: 'Level 300',
+            },
+          },
+        });
+        setAuthLoading(false);
+        
+        if (error) {
+          Alert.alert('Sign Up Error', error.message);
+          return;
+        }
+
+        if (role === 'rep') {
+          setApprovalState('pending');
+        } else {
+          setApprovalState('registered');
+        }
       } else {
-        setApprovalState('registered');
+        const { data, error } = await supabase.auth.signInWithPassword({
+          email,
+          password
+        });
+        setAuthLoading(false);
+        
+        if (error) {
+          Alert.alert('Sign In Error', error.message);
+          return;
+        }
+        
+        router.replace('/dashboard');
       }
-    } else {
-      const { data, error } = await supabase.auth.signInWithPassword({
-        email,
-        password
-      });
+    } catch (err: any) {
       setAuthLoading(false);
-      
-      if (error) {
-        alert(error.message);
-        return;
-      }
-      
-      router.replace('/dashboard');
+      Alert.alert('Authentication Error', err.message || 'Network request failed. Please check your internet connection.');
     }
   };
 
